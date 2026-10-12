@@ -66,13 +66,15 @@ def pump(until=None, timeout=2.0):
 class FakePointerEvent(object):
     """Stands in for a GDK pointer event, with the methods the plugin calls."""
 
-    def __init__(self, event_type, x, y, ctrl=False, button1=False):
+    def __init__(self, event_type, x, y, ctrl=False, button1=False, alt=False):
         self.type = event_type
         self._x = x
         self._y = y
         self._state = 0
         if ctrl:
             self._state |= Gdk.ModifierType.CONTROL_MASK
+        if alt:
+            self._state |= Gdk.ModifierType.MOD1_MASK
         if button1:
             self._state |= Gdk.ModifierType.BUTTON1_MASK
 

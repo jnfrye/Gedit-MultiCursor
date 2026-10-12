@@ -1,6 +1,6 @@
 from gi.repository import Gdk, Gtk
 
-from conftest import (FakeButtonEvent, FakePointerEvent, system_clipboard_text,
+from conftest import (FakeButtonEvent, FakePointerEvent, multicursor, system_clipboard_text,
                       set_system_clipboard_text, window_point_for_offset)
 
 
@@ -17,6 +17,21 @@ def ctrl_drag_move(editor, end):
     x, y = window_point_for_offset(editor.view, end)
     editor.plugin.on_event(editor.view, FakePointerEvent(
         Gdk.EventType.MOTION_NOTIFY, x, y, ctrl=True, button1=True))
+
+
+def alt_drag(editor, start, end):
+    """Press with Alt at `start`, then drag with Alt and the button held to `end`."""
+    view = editor.view
+    x, y = window_point_for_offset(view, start)
+    editor.plugin.on_event(view, FakePointerEvent(
+        Gdk.EventType.BUTTON_PRESS, x, y, alt=True))
+    alt_drag_move(editor, end)
+
+
+def alt_drag_move(editor, end):
+    x, y = window_point_for_offset(editor.view, end)
+    editor.plugin.on_event(editor.view, FakePointerEvent(
+        Gdk.EventType.MOTION_NOTIFY, x, y, alt=True, button1=True))
 
 
 def ctrl_drag_release(editor, end):
@@ -282,6 +297,47 @@ def test_pasting_over_a_box_replaces_it_line_by_line(make_editor):
     editor.paste()
 
     assert editor.text() == "aXef\naYef"
+
+
+def test_alt_drag_puts_a_caret_on_the_anchor_character_per_line(make_editor):
+    editor = make_editor("a=1\nbbb=2\ncc=3")
+
+    alt_drag(editor, start=1, end=12)
+
+    assert editor.main_selection() is None
+    assert editor.cursor_offsets() == [7, 12]
+
+
+def test_moving_the_pointer_steers_the_carets(make_editor):
+    editor = make_editor("a=b=c\nd=e=f")
+    alt_drag(editor, start=1, end=9)
+    assert editor.cursor_offsets() == [9]
+
+    alt_drag_move(editor, end=6)
+
+    assert editor.cursor_offsets() == [7]
+
+
+def test_alt_drag_skips_lines_without_the_character(make_editor):
+    editor = make_editor("a=1\nabc\nb=2")
+
+    alt_drag(editor, start=1, end=9)
+
+    assert editor.cursor_offsets() == [9]
+
+
+def test_closest_column_picks_the_nearest_occurrence():
+    assert multicursor.closest_column("a=b=c", "=", 0) == 1
+    assert multicursor.closest_column("a=b=c", "=", 3) == 3
+    assert multicursor.closest_column("a=b=c", "=", 9) == 3
+
+
+def test_closest_column_breaks_ties_to_the_left():
+    assert multicursor.closest_column("a=b=c", "=", 2) == 1
+
+
+def test_closest_column_is_none_without_the_character():
+    assert multicursor.closest_column("abc", "=", 1) is None
 
 
 def test_line_ending_inside_box_is_selected_to_its_end(make_editor):
