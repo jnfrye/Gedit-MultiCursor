@@ -64,20 +64,31 @@ def pump(until=None, timeout=2.0):
         time.sleep(0.005)
 
 
-class FakeButtonEvent(object):
-    """Stands in for a GDK button press, with the methods the plugin calls."""
+class FakePointerEvent(object):
+    """Stands in for a GDK pointer event, with the methods the plugin calls."""
 
-    def __init__(self, x, y, ctrl=False):
-        self.type = Gdk.EventType.BUTTON_PRESS
+    def __init__(self, event_type, x, y, ctrl=False, button1=False):
+        self.type = event_type
         self._x = x
         self._y = y
-        self._state = Gdk.ModifierType.CONTROL_MASK if ctrl else 0
+        self._state = 0
+        if ctrl:
+            self._state |= Gdk.ModifierType.CONTROL_MASK
+        if button1:
+            self._state |= Gdk.ModifierType.BUTTON1_MASK
 
     def get_state(self):
         return (True, self._state)
 
     def get_coords(self):
         return (True, self._x, self._y)
+
+
+class FakeButtonEvent(FakePointerEvent):
+
+    def __init__(self, x, y, ctrl=False):
+        super(FakeButtonEvent, self).__init__(
+            Gdk.EventType.BUTTON_PRESS, x, y, ctrl=ctrl)
 
 
 def window_point_for_offset(view, offset):

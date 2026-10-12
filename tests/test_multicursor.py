@@ -1,6 +1,27 @@
 from gi.repository import Gdk, Gtk
 
-from conftest import FakeButtonEvent, window_point_for_offset
+from conftest import FakeButtonEvent, FakePointerEvent, window_point_for_offset
+
+
+def ctrl_drag(editor, start, end):
+    """Press with Ctrl at `start`, then drag with Ctrl held to `end`."""
+    view = editor.view
+    x, y = window_point_for_offset(view, start)
+    editor.plugin.on_event(view, FakePointerEvent(
+        Gdk.EventType.BUTTON_PRESS, x, y, ctrl=True))
+    ctrl_drag_move(editor, end)
+
+
+def ctrl_drag_move(editor, end):
+    x, y = window_point_for_offset(editor.view, end)
+    editor.plugin.on_event(editor.view, FakePointerEvent(
+        Gdk.EventType.MOTION_NOTIFY, x, y, ctrl=True, button1=True))
+
+
+def ctrl_drag_release(editor, end):
+    x, y = window_point_for_offset(editor.view, end)
+    editor.plugin.on_event(editor.view, FakePointerEvent(
+        Gdk.EventType.BUTTON_RELEASE, x, y, ctrl=True, button1=True))
 
 
 def test_ctrl_click_adds_cursor_where_clicked(make_editor):
@@ -8,9 +29,90 @@ def test_ctrl_click_adds_cursor_where_clicked(make_editor):
     x, y = window_point_for_offset(editor.view, 8)
 
     handled = editor.plugin.on_event(editor.view, FakeButtonEvent(x, y, ctrl=True))
+    editor.plugin.on_event(editor.view, FakePointerEvent(
+        Gdk.EventType.BUTTON_RELEASE, x, y, ctrl=True))
 
     assert handled is True
     assert editor.cursor_offsets() == [8]
+
+
+def test_ctrl_drag_down_adds_cursor_on_each_line_at_press_column(make_editor):
+    editor = make_editor("abcdef\nabcdef\nabcdef\nabcdef")
+
+    ctrl_drag(editor, start=2, end=19)
+
+    assert editor.cursor_offsets() == [9, 16]
+
+
+def test_typing_after_ctrl_drag_inserts_on_every_line(make_editor):
+    editor = make_editor("abcdef\nabcdef\nabcdef\nabcdef")
+    ctrl_drag(editor, start=2, end=19)
+    ctrl_drag_release(editor, end=19)
+
+    editor.type_text("X")
+
+    assert editor.buffer.get_text(
+        editor.buffer.get_start_iter(), editor.buffer.get_end_iter(), True
+    ) == "abXcdef\nabXcdef\nabXcdef\nabcdef"
+
+
+def test_repeated_motion_does_not_duplicate_carets(make_editor):
+    editor = make_editor("abcdef\nabcdef\nabcdef\nabcdef")
+    ctrl_drag(editor, start=2, end=19)
+
+    ctrl_drag_move(editor, end=20)
+    ctrl_drag_move(editor, end=19)
+
+    assert editor.cursor_offsets() == [9, 16]
+
+
+def test_motion_after_release_adds_no_carets(make_editor):
+    editor = make_editor("abcdef\nabcdef\nabcdef\nabcdef")
+    ctrl_drag(editor, start=2, end=19)
+    ctrl_drag_release(editor, end=19)
+
+    ctrl_drag_move(editor, end=26)
+
+    assert editor.cursor_offsets() == [9, 16]
+
+
+def test_drag_without_ctrl_adds_no_carets(make_editor):
+    editor = make_editor("abcdef\nabcdef\nabcdef\nabcdef")
+    x, y = window_point_for_offset(editor.view, 2)
+    editor.plugin.on_event(editor.view, FakePointerEvent(
+        Gdk.EventType.BUTTON_PRESS, x, y))
+    x, y = window_point_for_offset(editor.view, 19)
+    editor.plugin.on_event(editor.view, FakePointerEvent(
+        Gdk.EventType.MOTION_NOTIFY, x, y, button1=True))
+
+    assert editor.cursor_offsets() == []
+
+
+def test_ctrl_drag_back_up_removes_carets_and_adds_above(make_editor):
+    editor = make_editor("abcdef\nabcdef\nabcdef\nabcdef")
+
+    ctrl_drag(editor, start=9, end=23)
+    assert editor.cursor_offsets() == [16, 23]
+
+    ctrl_drag_move(editor, end=2)
+    assert editor.cursor_offsets() == [2]
+
+
+def test_ctrl_drag_skips_lines_shorter_than_press_column(make_editor):
+    editor = make_editor("abcdef\na\nabcdef\nabcdef")
+
+    ctrl_drag(editor, start=2, end=13)
+
+    assert editor.cursor_offsets() == [11]
+
+
+def test_ctrl_drag_moves_main_caret_to_press_point(make_editor):
+    editor = make_editor("abcdef\nabcdef\nabcdef\nabcdef")
+
+    ctrl_drag(editor, start=2, end=19)
+
+    caret = editor.buffer.get_iter_at_mark(editor.buffer.get_insert())
+    assert caret.get_offset() == 2
 
 
 def test_plain_click_clears_extra_cursors(make_editor):

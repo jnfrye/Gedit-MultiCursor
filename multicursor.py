@@ -21,6 +21,8 @@ class MultiCursor(GObject.Object, Gedit.ViewActivatable):
     self.clipboard = ''
     # a list of cursors besides the document cursor
     self.cursors = [ ]
+    # the Ctrl+drag in progress, if any
+    self._drag = None
     # map keyboard shortcuts
     self.keymap = {
       'Escape': self.clear_cursors
@@ -90,11 +92,53 @@ class MultiCursor(GObject.Object, Gedit.ViewActivatable):
         (b, x, y) = event.get_coords()
         (x, y) = view.window_to_buffer_coords(Gtk.TextWindowType.TEXT, x, y)
         pos = view.get_iter_at_location(x, y)[1]
-        self.add_cursor(pos, pos)
+        self._drag = { 'start': pos.get_offset(), 'x': x, 'moved': False, 'cursors': [ ] }
         return(True)
       else:
         self.clear_cursors()
+    elif event.type == Gdk.EventType.MOTION_NOTIFY:
+      if ((self._drag is not None) and
+          (event.get_state()[1] & Gdk.ModifierType.CONTROL_MASK) and
+          (event.get_state()[1] & Gdk.ModifierType.BUTTON1_MASK)):
+        (b, x, y) = event.get_coords()
+        (x, y) = view.window_to_buffer_coords(Gtk.TextWindowType.TEXT, x, y)
+        self.drag_to(view, x, y)
+        return(True)
+    elif event.type == Gdk.EventType.BUTTON_RELEASE:
+      if (self._drag is not None):
+        if (not self._drag['moved']):
+          pos = self.doc.get_iter_at_offset(self._drag['start'])
+          self.add_cursor(pos, pos)
+        self._drag = None
+        return(True)
     return False
+
+  # place a cursor on each line between the press and the pointer, at the press column
+  def drag_to(self, view, x, y):
+    drag = self._drag
+    if (not drag['moved']):
+      self.doc.place_cursor(self.doc.get_iter_at_offset(drag['start']))
+    drag['moved'] = True
+    for cursor in drag['cursors']:
+      self.remove_cursor(self.cursors.index(cursor))
+    drag['cursors'] = [ ]
+    press_line = self.doc.get_iter_at_offset(drag['start']).get_line()
+    target_line = view.get_iter_at_location(x, y)[1].get_line()
+    if (target_line >= press_line):
+      lines = range(press_line + 1, target_line + 1)
+    else:
+      lines = range(target_line, press_line)
+    for line in lines:
+      start = self.doc.get_iter_at_line(line)
+      end = start.copy()
+      if (not end.ends_line()):
+        end.forward_to_line_end()
+      if (view.get_iter_location(end).x < drag['x']):
+        continue
+      rect = view.get_iter_location(start)
+      pos = view.get_iter_at_location(drag['x'], rect.y + rect.height // 2)[1]
+      self.add_cursor(pos, pos)
+      drag['cursors'].append(self.cursors[-1])
 
   def on_key_press(self, view, event):
     _, keyval, _, _, _ = Gdk.Keymap.get_default().translate_keyboard_state(event.hardware_keycode, event.state, 0)
