@@ -14,12 +14,8 @@ class MultiCursor(GObject.Object, Gedit.ViewActivatable):
     self._in_user_action = False
     # a list of functions to run when the user action is complete
     self._user_actions = [ ]
-    # whether a paste has just happened
-    self._handled_paste = False
     # the current undo stack level
     self.undo_level = 0
-    # the contents of the clipboard on the last copy/cut operation
-    self.clipboard = ''
     # a list of cursors besides the document cursor
     self.cursors = [ ]
     # the Ctrl+drag in progress, if any
@@ -51,9 +47,7 @@ class MultiCursor(GObject.Object, Gedit.ViewActivatable):
     # bind events
     self.add_handler(self.view, 'event', self.on_event)
     self.add_handler(self.view, 'move-cursor', self.mc_move_cursor)
-    self.add_handler(self.view, 'copy-clipboard', self.mc_save_clipboard)
     self.add_handler(self.view, 'copy-clipboard', self.mc_put_box_on_clipboard, 'after')
-    self.add_handler(self.view, 'cut-clipboard', self.mc_save_clipboard)
     self.add_handler(self.view, 'paste-clipboard', self.mc_paste_clipboard)
     self.add_handler(self.view, 'undo', self.undo)
     self.add_handler(self.view, 'redo', self.redo)
@@ -280,19 +274,8 @@ class MultiCursor(GObject.Object, Gedit.ViewActivatable):
 
   # insert text at every cursor
   def mc_insert(self, start_delta, text):
-    # if a paste was just handled and we're inserting the global clipboard contents,
-    #  insert local clipboard contents for each cursor
-    if ((self._handled_paste) and (text == self.clipboard)):
-      for cursor in self.cursors:
-        if ((cursor.clipboard is not None) and (len(cursor.clipboard) > 0)):
-          cursor.insert(start_delta, cursor.clipboard)
-        else:
-          cursor.insert(start_delta, text)
-    else:
-      for cursor in self.cursors:
-        cursor.insert(start_delta, text)
-    # any paste action has resulted in an insertion, so clear for next time
-    self._handled_paste = False
+    for cursor in self.cursors:
+      cursor.insert(start_delta, text)
 
   # delete text at every cursor
   def mc_delete(self, start_delta, end_delta):
@@ -310,14 +293,6 @@ class MultiCursor(GObject.Object, Gedit.ViewActivatable):
     for cursor in self.cursors:
       cursor.move(step_size, count, extend_selection)
     
-  # copy the selection at every cursor
-  def mc_save_clipboard(self, view):
-    (sel_start, sel_end) = self.order_iters(self.get_selection_iters())
-    self.clipboard = self.doc.get_text(sel_start, sel_end, True)
-    # save the global clipboard so we can tell when it's being pasted
-    for cursor in self.cursors:
-      cursor.save_text()
-      
   # put the selected text of every cursor on the system clipboard, top to bottom
   def mc_put_box_on_clipboard(self, view):
     pieces = [ ]
@@ -392,17 +367,11 @@ class Cursor:
     self.doc = self.view.get_buffer()
     # add marks for the cursor and selection area
     self.tag = MarkTag(self.view, 'multicursor', start_iter, end_iter)
-    # make a clipboard local to this cursor
-    self.clipboard = ''
     # safe the offset within the line for when the cursor crosses empty lines
     self.line_offset = None
     # make a place to save state for undo operations
     self.state = dict()
     self.initial_state_index = None
-    
-  # save the text to the local clipboard
-  def save_text(self):
-    self.clipboard = self.tag.get_text()
     
   # save state at the given index
   def save_state(self, index):

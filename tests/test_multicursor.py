@@ -251,6 +251,17 @@ def test_matching_line_counts_paste_one_line_per_caret(make_editor):
     assert editor.text() == "xbcdyz\nxBCDyz"
 
 
+def test_text_from_another_program_pastes_one_line_per_caret(make_editor):
+    editor = make_editor("xyz\nxyz")
+    ctrl_drag(editor, start=1, end=5)
+    ctrl_drag_release(editor, end=5)
+    set_system_clipboard_text("bcd\nBCD")
+
+    editor.paste()
+
+    assert editor.text() == "xbcdyz\nxBCDyz"
+
+
 def test_mismatched_line_counts_paste_the_full_text_at_each_caret(make_editor):
     editor = make_editor("xyz\nxyz")
     ctrl_drag(editor, start=1, end=5)
