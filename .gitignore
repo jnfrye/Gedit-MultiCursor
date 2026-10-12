@@ -1,6 +1,10 @@
 # Text editor backup files
 *~
 
+# Virtual environment and test cache
+.venv/
+.pytest_cache/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

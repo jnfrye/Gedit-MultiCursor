@@ -1,7 +1,6 @@
-from gi.repository import GObject, Gtk, Gdk, Gedit, Pango
+from gi.repository import GObject, Gtk, Gdk, Gedit
+import xml.etree.ElementTree as ElementTree
 
-import re
-from collections import OrderedDict
 
 class MultiCursor(GObject.Object, Gedit.ViewActivatable):
   __gtype_name__ = "MultiCursor"
@@ -15,26 +14,18 @@ class MultiCursor(GObject.Object, Gedit.ViewActivatable):
     self._in_user_action = False
     # a list of functions to run when the user action is complete
     self._user_actions = [ ]
-    # whether a paste has just happened
-    self._handled_paste = False
     # the current undo stack level
     self.undo_level = 0
-    # a MarkTag that tracks the text entered at the main insertion point
-    self.tracker = None
-    # the contents of the clipboard on the last copy/cut operation
-    self.clipboard = ''
     # a list of cursors besides the document cursor
     self.cursors = [ ]
-    # a list of tags around all instances of the matched selection text
-    self.matches = [ ]
+    # the Ctrl+drag in progress, if any
+    self._drag = None
+    # the handler that recolors the selection when the style scheme changes
+    self._scheme_handler = None
     # map keyboard shortcuts
     self.keymap = {
-      '<Primary>d': self.match_cursor,
-      '<Primary><Shift>d': self.match_cursor_fuzzy,
-      '<Primary>u': self.unmatch_cursor,
-      '<Primary>Up': self.column_select_up,
-      '<Primary>Down': self.column_select_down,
-      'Escape': self.clear_cursors
+      'Escape': self.clear_cursors,
+      '<Primary>space': self.align_carets
     }
     self.compile_keymap()
 
@@ -53,19 +44,28 @@ class MultiCursor(GObject.Object, Gedit.ViewActivatable):
   def do_activate(self):
     # retain a reference to the document
     self.doc = self.view.get_buffer()
+    self._scheme_handler = self.doc.connect('notify::style-scheme', self.on_style_scheme_changed)
     # bind events
     self.add_handler(self.view, 'event', self.on_event)
     self.add_handler(self.view, 'move-cursor', self.mc_move_cursor)
-    self.add_handler(self.view, 'copy-clipboard', self.mc_save_clipboard)
-    self.add_handler(self.view, 'cut-clipboard', self.mc_save_clipboard)
+    self.add_handler(self.view, 'copy-clipboard', self.mc_put_box_on_clipboard, 'after')
     self.add_handler(self.view, 'paste-clipboard', self.mc_paste_clipboard)
     self.add_handler(self.view, 'undo', self.undo)
     self.add_handler(self.view, 'redo', self.redo)
-    self.add_handler(self.view, 'undo', self.undo_after, 'after')
-    self.add_handler(self.view, 'redo', self.redo_after, 'after')
   def do_deactivate(self):
     self.clear_cursors()
     self.remove_handlers()
+    if (self._scheme_handler is not None):
+      self.doc.disconnect(self._scheme_handler)
+      self._scheme_handler = None
+
+  # recolor the selection tag when the document's style scheme changes
+  def on_style_scheme_changed(self, doc, pspec):
+    tag = self.doc.get_tag_table().lookup('multicursor')
+    if (tag is not None):
+      (background, foreground) = selection_colors(self.view, self.doc)
+      tag.set_property('background', background)
+      tag.set_property('foreground', foreground)
 
   # receive events from the document that control multiple cursors
   def hook_document(self):
@@ -99,15 +99,128 @@ class MultiCursor(GObject.Object, Gedit.ViewActivatable):
     if event.type == Gdk.EventType.KEY_PRESS:
       return self.on_key_press(view, event)
     elif event.type == Gdk.EventType.BUTTON_PRESS:
-      if (event.get_state()[1] & Gdk.ModifierType.CONTROL_MASK):
+      state = event.get_state()[1]
+      if ((state & Gdk.ModifierType.MOD1_MASK) and
+          not (state & Gdk.ModifierType.CONTROL_MASK)):
         (b, x, y) = event.get_coords()
         (x, y) = view.window_to_buffer_coords(Gtk.TextWindowType.TEXT, x, y)
-        pos = view.get_iter_at_location(x, y)
-        self.add_cursor(pos, pos)
+        pos = view.get_iter_at_location(x, y)[1]
+        char = pos.get_char()
+        if (char.strip() == ''):
+          return False
+        self.doc.place_cursor(pos)
+        self._drag = { 'mode': 'smart', 'start': pos.get_offset(), 'char': char,
+                       'x': x, 'moved': False, 'cursors': [ ] }
+        return(True)
+      if (state & Gdk.ModifierType.CONTROL_MASK):
+        (b, x, y) = event.get_coords()
+        (x, y) = view.window_to_buffer_coords(Gtk.TextWindowType.TEXT, x, y)
+        pos = view.get_iter_at_location(x, y)[1]
+        self._drag = { 'mode': 'box', 'start': pos.get_offset(), 'x': x, 'moved': False,
+                       'cursors': [ ] }
         return(True)
       else:
         self.clear_cursors()
+    elif event.type == Gdk.EventType.MOTION_NOTIFY:
+      if (self._drag is not None):
+        state = event.get_state()[1]
+        modifier = (Gdk.ModifierType.MOD1_MASK if self._drag['mode'] == 'smart'
+                    else Gdk.ModifierType.CONTROL_MASK)
+        if ((state & modifier) and (state & Gdk.ModifierType.BUTTON1_MASK)):
+          (b, x, y) = event.get_coords()
+          (x, y) = view.window_to_buffer_coords(Gtk.TextWindowType.TEXT, x, y)
+          if (self._drag['mode'] == 'smart'):
+            self.smart_drag_to(view, x, y)
+          else:
+            self.drag_to(view, x, y)
+          return(True)
+    elif event.type == Gdk.EventType.BUTTON_RELEASE:
+      if (self._drag is not None):
+        if ((self._drag['mode'] == 'box') and (not self._drag['moved'])):
+          pos = self.doc.get_iter_at_offset(self._drag['start'])
+          self.add_cursor(pos, pos)
+        self._drag = None
+        return(True)
     return False
+
+  # place a caret on the nearest occurrence of the anchor character on each line
+  #  between the press and the pointer, skipping lines without it
+  def smart_drag_to(self, view, x, y):
+    drag = self._drag
+    drag['moved'] = True
+    for cursor in drag['cursors']:
+      self.remove_cursor(self.cursors.index(cursor))
+    drag['cursors'] = [ ]
+    press_line = self.doc.get_iter_at_offset(drag['start']).get_line()
+    pointer = view.get_iter_at_location(x, y)[1]
+    target_line = pointer.get_line()
+    if (target_line >= press_line):
+      lines = range(press_line + 1, target_line + 1)
+    else:
+      lines = range(target_line, press_line)
+    for line in lines:
+      start = self.doc.get_iter_at_line(line)
+      end = start.copy()
+      if (not end.ends_line()):
+        end.forward_to_line_end()
+      column = closest_column(self.doc.get_text(start, end, True), drag['char'],
+                              pointer.get_line_offset())
+      if (column is None):
+        continue
+      pos = self.doc.get_iter_at_line_offset(line, column)
+      self.add_cursor(pos, pos)
+      drag['cursors'].append(self.cursors[-1])
+
+  # select the box between the press and the pointer on each line between them
+  def drag_to(self, view, x, y):
+    drag = self._drag
+    press = self.doc.get_iter_at_offset(drag['start'])
+    if (not drag['moved']):
+      self.doc.place_cursor(press)
+    drag['moved'] = True
+    for cursor in drag['cursors']:
+      self.remove_cursor(self.cursors.index(cursor))
+    drag['cursors'] = [ ]
+    press_line = press.get_line()
+    target_line = view.get_iter_at_location(x, y)[1].get_line()
+    if (target_line >= press_line):
+      lines = range(press_line + 1, target_line + 1)
+    else:
+      lines = range(target_line, press_line)
+    left = min(drag['x'], x)
+    right = max(drag['x'], x)
+    if (left == right):
+      self.doc.place_cursor(press)
+    else:
+      span = self.span_on_line(view, press_line, left, right)
+      if (span is not None):
+        (a, b) = span
+        if (drag['x'] <= x):
+          self.doc.select_range(a, b)
+        else:
+          self.doc.select_range(b, a)
+    for line in lines:
+      span = self.span_on_line(view, line, left, right)
+      if (span is None):
+        continue
+      (a, b) = span
+      self.add_cursor(a, b)
+      drag['cursors'].append(self.cursors[-1])
+
+  # the iters at the left and right x positions on a line, clamped to the line's end,
+  #  or None if the line ends before the left position
+  def span_on_line(self, view, line, left, right):
+    start = self.doc.get_iter_at_line(line)
+    end = start.copy()
+    if (not end.ends_line()):
+      end.forward_to_line_end()
+    if (view.get_iter_location(end).x < left):
+      return None
+    rect = view.get_iter_location(start)
+    y = rect.y + rect.height // 2
+    a = view.get_iter_at_location(left, y)[1]
+    b = view.get_iter_at_location(right, y)[1]
+    return (a, b)
 
   def on_key_press(self, view, event):
     _, keyval, _, _, _ = Gdk.Keymap.get_default().translate_keyboard_state(event.hardware_keycode, event.state, 0)
@@ -115,8 +228,8 @@ class MultiCursor(GObject.Object, Gedit.ViewActivatable):
     for shortcut in self.keymap.values():
       if ((shortcut['accel'][0] == keyval) and 
           (shortcut['accel'][1] == mask)):
-        shortcut['action']()
-        return(True)
+        if (shortcut['action']() is not False):
+          return(True)
     return(False)
 
   def order_iters(self, iters):
@@ -129,143 +242,6 @@ class MultiCursor(GObject.Object, Gedit.ViewActivatable):
     start = self.doc.get_iter_at_mark(self.doc.get_insert())
     end = self.doc.get_iter_at_mark(self.doc.get_selection_bound())
     return((start, end))
-  
-  # add a cursor at the next instance of the selected text
-  def match_cursor_fuzzy(self):
-    self.match_cursor(fuzzy=True)
-  def match_cursor(self, fuzzy=False):
-    (sel_start, sel_end) = self.order_iters(self.get_selection_iters())
-    text = self.doc.get_text(sel_start, sel_end, True)
-    if (len(text) == 0):
-      return
-    if (len(self.cursors) > 0):
-      search_start = self.cursors[-1].tag.get_end_iter()
-    else:
-      self.tag_all_matches(text, fuzzy)
-      search_start = sel_end
-    if (search_start.get_offset() < sel_start.get_offset()):
-      search_end = sel_start
-    else:
-      search_end = None
-    match = self.get_next_match(text, search_start, search_end, fuzzy)
-    # wrap around
-    if ((match is None) and (search_start.get_offset() >= sel_end.get_offset())):
-      search_end = sel_start
-      search_start = self.doc.get_start_iter()
-      match = self.get_next_match(text, search_start, search_end, fuzzy)
-    if (match is not None):    
-      self.add_cursor(match[0], match[1])
-      self.cursors[-1].scroll_onscreen()
-      # if there's a casing difference between the search text and the match,
-      #  attach the casing difference to the cursor and track its text
-      if (fuzzy):
-        main_casing = Casing().detect(text)
-        match_casing = Casing().detect(self.doc.get_text(match[0], match[1], True))
-        if ((match_casing.case != main_casing.case) or 
-            (match_casing.separator != main_casing.separator) or
-            (match_casing.prefix != main_casing.prefix) or
-            (match_casing.suffix != main_casing.suffix)):
-          self.cursors[-1].tracker = MarkTag(
-            self.view, 'tracker', match[0], match[1])
-          self.cursors[-1].casing = match_casing
-          if (self.tracker is None):
-            self.tracker = MarkTag(
-              self.view, 'tracker', sel_start, sel_end)
-  
-  # highlight all text that matches the selected text
-  def tag_all_matches(self, text, fuzzy):
-    (sel_start, sel_end) = self.order_iters(self.get_selection_iters())
-    start_iter = self.doc.get_start_iter()
-    while (True):
-      match = self.get_next_match(text, start_iter, None, fuzzy)
-      if (match is None):
-        break
-      start_iter = match[1]
-      # don't tag the selection
-      if (match[0].get_offset() == sel_start.get_offset()):
-        continue
-      self.matches.append(MarkTag(self.view, 'multicursor_match', match[0], match[1]))
-  
-  def clear_matches(self):
-    for match in self.matches:
-      match.remove()
-    self.matches = [ ]
-
-  def get_next_match(self, text, search_start, search_end, fuzzy):
-    flags = 0
-    if (fuzzy):
-      flags = Gtk.TextSearchFlags.CASE_INSENSITIVE
-      casing = Casing().detect(text)
-      alternatives = ( text, )
-      if ((casing.case != None) and (casing.separator != None)):
-        words = casing.split(text)
-        alternatives = (
-          Casing('lower', '_').join(words),
-          Casing('lower', '-').join(words),
-          Casing('lower', '').join(words)
-        )
-      earliest = None
-      for alt in alternatives:
-        match = search_start.forward_search(alt, flags, search_end)
-        if ((match is not None) and 
-            ((earliest is None) or 
-             (match[0].get_offset() < earliest[0].get_offset()))):
-          earliest = match
-      return(earliest)
-    else:
-      return(search_start.forward_search(text, 0, search_end))
-  
-  def unmatch_cursor(self):
-    self.remove_cursor(-1)
-    # scroll back to the last cursor, or the selection
-    if (len(self.cursors) > 0):
-      self.cursors[-1].scroll_onscreen()
-    else:
-      self.view.scroll_mark_onscreen(self.doc.get_insert())
-  
-  # extend the cursor in a column to previous or subsequent lines
-  def column_select_up(self):
-    self.column_select(-1)
-  def column_select_down(self):
-    self.column_select(1)
-  def column_select(self, line_delta):
-    # get the lines of the first and last cursor
-    (sel_start, sel_end) = self.order_iters(self.get_selection_iters())
-    sel_line = sel_start.get_line()
-    min_line = sel_line
-    max_line = sel_line
-    for cursor in self.cursors:
-      line = cursor.tag.get_start_iter().get_line()
-      min_line = min(line, min_line)
-      max_line = max(max_line, line)
-    # expand up or down
-    start_line = None
-    if ((line_delta < 0) and (max_line == sel_line)):
-      start_line = min_line
-    elif ((line_delta > 0) and (min_line == sel_line)):
-      start_line = max_line
-    # if the user is going in the opposite direction from before, remove matches
-    if (start_line is None):
-      self.unmatch_cursor()
-      return
-    # copy the position of the selection so the offset holds even when crossing
-    #  incomplete or empty lines
-    line = start_line + line_delta
-    start_iter = sel_start.copy()
-    start_iter.set_line(line)
-    if (not start_iter.ends_line()):
-      start_iter.forward_to_line_end()
-    start_iter.set_line_offset(min(sel_start.get_line_offset(), start_iter.get_line_offset()))
-    end_iter = sel_end.copy()
-    end_iter.set_line(line + (sel_end.get_line() - sel_start.get_line()))
-    if (not end_iter.ends_line()):
-      end_iter.forward_to_line_end()
-    end_iter.set_line_offset(min(sel_end.get_line_offset(), end_iter.get_line_offset()))
-    # add a cursor as long as we're actually on a different line, meaning we haven't hit
-    #  the start or end of the document yet
-    if (start_iter.get_line() != start_line):
-      self.add_cursor(start_iter, end_iter)
-      self.cursors[-1].scroll_onscreen()
   
   # add another cursor at the given position
   def add_cursor(self, start_iter, end_iter):
@@ -285,44 +261,18 @@ class MultiCursor(GObject.Object, Gedit.ViewActivatable):
       del self.cursors[index]
       if (len(self.cursors) == 0):
         self.unhook_document()
-        if (self.tracker is not None):
-          self.tracker.remove()
-          self.tracker = None
 
   # remove all cursors
   def clear_cursors(self):
     if (len(self.cursors) > 0):
       while (len(self.cursors) > 0):
         self.remove_cursor(-1)
-    self.clear_matches()
-    if (self.tracker is not None):
-      self.tracker.remove()
-      self.tracker = None
       
-  # restore cursor state after undo and redo operations
+  # remove extra cursors before undo and redo so only the text is restored
   def undo(self, view):
-    undo_manager = self.doc.get_undo_manager()
-    self._can_undo = undo_manager.can_undo()
+    self.clear_cursors()
   def redo(self, view):
-    undo_manager = self.doc.get_undo_manager()
-    self._can_redo = undo_manager.can_redo()
-  def undo_after(self, view):
-    if (not self._can_undo): return
-    self.undo_level -= 1
-    keep_cursors = [ ]
-    for cursor in self.cursors:
-      # remove cursors if we go back past the point where they were created
-      if (self.undo_level < cursor.initial_state_index):
-        cursor.remove()
-      else:
-        cursor.recall_state(self.undo_level)
-        keep_cursors.append(cursor)
-    self.cursors = keep_cursors
-  def redo_after(self, view):
-    if (not self._can_redo): return
-    self.undo_level += 1
-    for cursor in self.cursors:
-      cursor.recall_state(self.undo_level)
+    self.clear_cursors()
   
   # schedule a multicursor insert for when the user's action is done
   def insert(self, doc, start, text, length):
@@ -360,35 +310,40 @@ class MultiCursor(GObject.Object, Gedit.ViewActivatable):
   # run scheduled functions
   def end_user_action(self, doc=None):
     self._in_user_action = False
-    # remove all match previews now that the user is doing something
-    self.clear_matches()
     # execute the scheduled actions
     for (action, args) in self._user_actions:
       action(*args)
     self._user_actions = [ ]
-    # update casing information
-    self.mc_track_casing()
     # save the state of all the cursors after the user does something
     self.undo_level += 1
     for cursor in self.cursors:
       cursor.save_state(self.undo_level)
     
 
+  # pad each caret with spaces so all the carets line up on the rightmost column
+  def align_carets(self):
+    if (len(self.cursors) == 0):
+      return(False)
+    slots = [ (self.doc.get_iter_at_mark(self.doc.get_insert()).get_offset(), None) ]
+    for cursor in self.cursors:
+      slots.append((cursor.tag.get_start_iter().get_offset(), cursor))
+    columns = [ self.doc.get_iter_at_offset(offset).get_line_offset() for (offset, cursor) in slots ]
+    pads = padding_to_align(columns)
+    for index in sorted(range(len(slots)), key=lambda i: slots[i][0], reverse=True):
+      (offset, cursor) = slots[index]
+      if (pads[index] == 0):
+        continue
+      self.doc.insert(self.doc.get_iter_at_offset(offset), ' ' * pads[index])
+      after = self.doc.get_iter_at_offset(offset + pads[index])
+      if (cursor is None):
+        self.doc.place_cursor(after)
+      else:
+        cursor.tag.move_marks(after, after)
+
   # insert text at every cursor
   def mc_insert(self, start_delta, text):
-    # if a paste was just handled and we're inserting the global clipboard contents,
-    #  insert local clipboard contents for each cursor
-    if ((self._handled_paste) and (text == self.clipboard)):
-      for cursor in self.cursors:
-        if ((cursor.clipboard is not None) and (len(cursor.clipboard) > 0)):
-          cursor.insert(start_delta, cursor.clipboard)
-        else:
-          cursor.insert(start_delta, text)
-    else:
-      for cursor in self.cursors:
-        cursor.insert(start_delta, text)
-    # any paste action has resulted in an insertion, so clear for next time
-    self._handled_paste = False
+    for cursor in self.cursors:
+      cursor.insert(start_delta, text)
 
   # delete text at every cursor
   def mc_delete(self, start_delta, end_delta):
@@ -396,25 +351,8 @@ class MultiCursor(GObject.Object, Gedit.ViewActivatable):
     for cursor in self.cursors:
       cursor.delete(start_delta, end_delta)
 
-  # update any cursors that track casing
-  def mc_track_casing(self):
-    # if we're not tracking casing, there's nothing to do
-    if (self.tracker is None): return
-    # get the casing of the text entered at the main cursor    
-    main_text = self.tracker.get_text()
-    main_casing = Casing().detect(main_text)
-    words = main_casing.split(main_text)
-    if (not main_casing.is_keyword()): return
-    for cursor in self.cursors:
-      if (cursor.casing is not None):
-        cursor.tag.set_capturing_gravity(False)
-        cursor.tracker.set_text(cursor.casing.join(words))
-        cursor.tag.set_capturing_gravity(True)
-
   # move every cursor
   def mc_move_cursor(self, view, step_size, count, extend_selection):
-    # remove all match previews now that the user is doing something
-    self.clear_matches()
     # clear all cursors if the movement would put them all in the same place
     if ((step_size == Gtk.MovementStep.BUFFER_ENDS) or
         (step_size == Gtk.MovementStep.PAGES)):
@@ -423,16 +361,69 @@ class MultiCursor(GObject.Object, Gedit.ViewActivatable):
     for cursor in self.cursors:
       cursor.move(step_size, count, extend_selection)
     
-  # copy the selection at every cursor
-  def mc_save_clipboard(self, view):
-    (sel_start, sel_end) = self.order_iters(self.get_selection_iters())
-    self.clipboard = self.doc.get_text(sel_start, sel_end, True)
-    # save the global clipboard so we can tell when it's being pasted
+  # put the selected text of every cursor on the system clipboard, top to bottom
+  def mc_put_box_on_clipboard(self, view):
+    pieces = [ ]
+    bounds = self.doc.get_selection_bounds()
+    if (bounds):
+      pieces.append((bounds[0].get_offset(), self.doc.get_text(bounds[0], bounds[1], True)))
     for cursor in self.cursors:
-      cursor.save_text()
-      
+      start = cursor.tag.get_start_iter()
+      if (cursor.tag.get_length() > 0):
+        pieces.append((start.get_offset(), cursor.tag.get_text()))
+    if (len(pieces) > 0):
+      text = '\n'.join(piece for (offset, piece) in sorted(pieces))
+      Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(text, -1)
+
+  # paste the system clipboard ourselves, so each caret can get its own line
   def mc_paste_clipboard(self, view):
-    self._handled_paste = True
+    view.stop_emission_by_name('paste-clipboard')
+    text = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).wait_for_text()
+    if (text is not None):
+      self.paste_text(text)
+
+  # insert the text at every caret, top to bottom: one line per caret when the
+  #  counts match, otherwise the whole text at each caret
+  def paste_text(self, text):
+    slots = [ ]
+    if (self.doc.get_has_selection()):
+      (sel_start, sel_end) = self.doc.get_selection_bounds()
+      slots.append(sel_start.get_offset())
+    else:
+      slots.append(self.doc.get_iter_at_mark(self.doc.get_insert()).get_offset())
+    for cursor in self.cursors:
+      slots.append(cursor.tag.get_start_iter().get_offset())
+    lines = text.split('\n')
+    if ((len(slots) > 1) and (len(lines) == len(slots))):
+      pieces = lines
+    else:
+      pieces = [ text ] * len(slots)
+    order = sorted(range(len(slots)), key=lambda i: slots[i])
+    for index in reversed(order):
+      piece = pieces[index]
+      if (index == 0):
+        self.paste_at_main(piece)
+      else:
+        self.paste_at_cursor(self.cursors[index - 1], piece)
+
+  def paste_at_main(self, piece):
+    if (self.doc.get_has_selection()):
+      (sel_start, sel_end) = self.doc.get_selection_bounds()
+      self.doc.delete(sel_start, sel_end)
+    start = self.doc.get_iter_at_mark(self.doc.get_insert())
+    offset = start.get_offset()
+    self.doc.insert(start, piece)
+    self.doc.place_cursor(self.doc.get_iter_at_offset(offset + len(piece)))
+
+  def paste_at_cursor(self, cursor, piece):
+    start = cursor.tag.get_start_iter()
+    end = cursor.tag.get_end_iter()
+    offset = start.get_offset()
+    if (end.get_offset() != offset):
+      self.doc.delete(start, end)
+    self.doc.insert(self.doc.get_iter_at_offset(offset), piece)
+    after = self.doc.get_iter_at_offset(offset + len(piece))
+    cursor.tag.move_marks(after, after)
 
 
 # this class manages a single extra cursor in the document
@@ -444,21 +435,11 @@ class Cursor:
     self.doc = self.view.get_buffer()
     # add marks for the cursor and selection area
     self.tag = MarkTag(self.view, 'multicursor', start_iter, end_iter)
-    # add properties for tracking any inserted text
-    self.tracker = None
-    # add a property to store the casing convention to use for insertion
-    self.casing = None
-    # make a clipboard local to this cursor
-    self.clipboard = ''
     # safe the offset within the line for when the cursor crosses empty lines
     self.line_offset = None
     # make a place to save state for undo operations
     self.state = dict()
     self.initial_state_index = None
-    
-  # save the text to the local clipboard
-  def save_text(self):
-    self.clipboard = self.tag.get_text()
     
   # save state at the given index
   def save_state(self, index):
@@ -484,8 +465,6 @@ class Cursor:
   # remove the cursor from the document
   def remove(self):
     self.tag.remove()
-    if (self.tracker is not None):
-      self.tracker.remove()
 
   # insert text at the cursor
   def insert(self, start_delta, text):
@@ -657,6 +636,54 @@ class Cursor:
 
 
 
+# the spaces each column needs to move to the rightmost column
+def padding_to_align(columns):
+  target = max(columns)
+  return([ target - column for column in columns ])
+
+# the column of the occurrence of `char` in `text` nearest `target`, preferring the
+#  left on a tie, or None if there's no occurrence
+def closest_column(text, char, target):
+  columns = [ i for (i, c) in enumerate(text) if c == char ]
+  if (len(columns) == 0):
+    return(None)
+  return(min(columns, key=lambda c: (abs(c - target), c)))
+
+# the background and foreground for selections, from the document's style scheme
+#  if it defines them, otherwise from the view's theme
+def selection_colors(view, doc):
+  background = view.get_style().lookup_color('selected_bg_color')[1].to_string()
+  foreground = view.get_style().lookup_color('selected_fg_color')[1].to_string()
+  scheme = doc.get_style_scheme()
+  if (scheme is not None):
+    colors = read_scheme_colors(scheme.get_filename(), 'selection')
+    if (colors is not None):
+      return(colors)
+  return((background, foreground))
+
+# read a style's background and foreground from a style scheme file, resolving
+#  named palette colors, or return None if the file doesn't define both
+def read_scheme_colors(filename, style_name):
+  try:
+    root = ElementTree.parse(filename).getroot()
+  except (OSError, TypeError, ElementTree.ParseError):
+    return(None)
+  palette = { c.get('name'): c.get('value') for c in root.iter('color') }
+  for style in root.iter('style'):
+    if (style.get('name') != style_name):
+      continue
+    resolved = [ ]
+    for attr in ('background', 'foreground'):
+      value = style.get(attr)
+      if ((value is not None) and not value.startswith('#')):
+        value = palette.get(value)
+      if (value is None):
+        return(None)
+      resolved.append(value)
+    return(tuple(resolved))
+  return(None)
+
+
 # this class manages a GtkTextTag, anchoring it with GtkTextMarks instead of GtkTextIters
 class MarkTag:
 
@@ -763,20 +790,10 @@ class MarkTag:
     if (tag is None):
       # style the selection part of a cursor
       if (self.name == 'multicursor'):
-        background = self.get_view_color('selected_bg_color')
-        foreground = self.get_view_color('selected_fg_color')
-        (background, foreground) = self.get_scheme_colors( 
-          'selection', (background, foreground))
+        (background, foreground) = selection_colors(self.view, self.doc)
         tag = self.doc.create_tag(self.name, 
                                    background=background, 
                                    foreground=foreground)
-      # style a preview of a match to the selection
-      elif (self.name == 'multicursor_match'):
-        tag = self.doc.create_tag(self.name, 
-                                  underline=Pango.Underline.SINGLE)
-      # style an invisible set of marks
-      elif (self.name == 'tracker'):
-        tag = None
       # this shouldn't happen, but make it obvious just in case
       else:
         tag = self.doc.create_tag(self.name, 
@@ -784,120 +801,8 @@ class MarkTag:
                                    foreground="#FFFFFF")
     return(tag)
 
-  # get the default color for the given style property of the view
-  def get_view_color(self, color_name):
-    return(self.view.get_style().lookup_color(color_name)[1].to_string())
-  
-  # get the given foreground and background colors from the current 
-  #  style scheme, falling back on the given defaults
-  def get_scheme_colors(self, style_name, defaults):
-    scheme = self.doc.get_style_scheme()
-    if (scheme is not None):
-      sel_style = scheme.get_style(style_name)
-      if (sel_style is not None):
-        return(sel_style.get_property('background'), 
-               sel_style.get_property('foreground'))
-    return(defaults)
+
     
 
 
 
-# this class handles detection and conversion between different casing conventions
-class Casing:
-  
-  # regexes
-  match_surround = re.compile(r'^([_-]*)(.*?)([_-]*)$')
-  match_cases = OrderedDict([
-    # to be lower case, either there must be at least one lower case character and no 
-    #  upper case ones or it must be in camelCase beginning with a lower case character
-    ('case', re.compile(r'^([a-z0-9_-]*[a-z]+[a-z0-9_-]*|[a-z][A-Za-z0-9]*)$')),
-    # to be upper case, there must be at least one upper case character and no lower case ones
-    ('CASE', re.compile(r'^[A-Z0-9_-]*[A-Z]+[A-Z0-9_-]*$')),
-    # to be title case, there must be at least one upper+lower combo or it must be CamelCase
-    #  beginning with an upper case character
-    ('Case', re.compile(r'^([\w-]*[A-Z][a-z][\w-]*|[A-Z][a-z][A-Za-z0-9]*)$'))
-  ])
-  match_separators = OrderedDict([
-    # this one handles single words in one case, where we can't know what the separator might be
-    (None, re.compile(r'^([A-Z0-9]+|[a-z0-9]+|[A-Z][a-z][a-z0-9]*)$')),
-    # this handles camelCase, treated as an empty separator
-    ('', re.compile(r'^[A-Za-z0-9]+$')),
-    # this handles the usual kind of word separators
-    ('_', re.compile(r'^[\w]+$')),
-    ('-', re.compile(r'^[A-Za-z0-9-]+$'))
-  ])
-  
-  def __init__(self, case=None, separator=None, prefix='', suffix=''):
-    # the case used for words in the string ('case', 'CASE', or 'Case')
-    self.case = case
-    # the separator used between words in the string, 
-    #  ('' for camelCase or CamelCase, '_' for snake_case or CONSTANT_CASE, 
-    #   and '-' for things like css-classes)
-    self.separator = separator
-    # optional strings at the beginning or end of the string
-    self.prefix = prefix
-    self.suffix = suffix
-    
-  # return whether the detected casing looks like a keyword
-  def is_keyword(self):
-    return((self.case is not None) or (self.separator is not None))
-  
-  # detect the casing convention for the given string and return an instance
-  #  with all properties set to the detected values or None if the text was
-  #  indeterminate in some way (e.g. you can't detect a separator from a single word)
-  def detect(self, text):
-    # remove prefixes and suffixes
-    m = Casing.match_surround.match(text)
-    if (m):
-      self.prefix = m.group(1)
-      text = m.group(2)
-      self.suffix = m.group(3)
-    # detect case and separator
-    for (key, pattern) in Casing.match_cases.items():
-      if (pattern.match(text)):
-        self.case = key
-        break
-    for (key, pattern) in Casing.match_separators.items():
-      if (pattern.match(text)):
-        self.separator = key
-        break
-    return(self)
-  
-  # split a string in this casing convention into words
-  def split(self, text):
-    # remove prefixes and suffixes
-    m = Casing.match_surround.match(text)
-    if (m):
-      prefix = m.group(1)
-      text = m.group(2)
-      suffix = m.group(3)
-    # split by simple separators
-    if (self.separator == '_'):
-      return(tuple(text.split('_')))
-    elif (self.separator == '-'):
-      return(tuple(text.split('-')))
-    elif (self.separator == ''):
-      # for camelCase, insert artificial separators on case boundaries 
-      #  so we can do a simple split
-      text = re.sub(r'([a-z])([A-Z])', r'\1,\2', text)
-      text = re.sub(r'([A-Z])([A-Z][a-z])', r'\1,\2', text)
-      return(tuple(text.lower().split(',')))
-    else:
-      return((text,))
-      
-  # assemble a list of words using this casing convention
-  def join(self, words):
-    if (self.case == 'case'):
-      words = map(lambda s: s.lower(), words)
-    elif (self.case == 'CASE'):
-      words = map(lambda s: s.upper(), words)
-    elif (self.case == 'Case'):
-      words = map(lambda s: s.capitalize(), words)
-    if ((self.separator == '') and (self.case == 'case')):
-      words = list(words)
-      words[1:] = map(lambda s: s.capitalize(), words[1:])
-    if (self.separator is not None):
-      inner = self.separator.join(words)
-    else:
-      inner = ''.join(words)
-    return(self.prefix+inner+self.suffix)
