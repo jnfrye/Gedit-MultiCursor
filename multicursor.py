@@ -24,7 +24,8 @@ class MultiCursor(GObject.Object, Gedit.ViewActivatable):
     self._scheme_handler = None
     # map keyboard shortcuts
     self.keymap = {
-      'Escape': self.clear_cursors
+      'Escape': self.clear_cursors,
+      '<Primary>space': self.align_carets
     }
     self.compile_keymap()
 
@@ -227,8 +228,8 @@ class MultiCursor(GObject.Object, Gedit.ViewActivatable):
     for shortcut in self.keymap.values():
       if ((shortcut['accel'][0] == keyval) and 
           (shortcut['accel'][1] == mask)):
-        shortcut['action']()
-        return(True)
+        if (shortcut['action']() is not False):
+          return(True)
     return(False)
 
   def order_iters(self, iters):
@@ -318,6 +319,26 @@ class MultiCursor(GObject.Object, Gedit.ViewActivatable):
     for cursor in self.cursors:
       cursor.save_state(self.undo_level)
     
+
+  # pad each caret with spaces so all the carets line up on the rightmost column
+  def align_carets(self):
+    if (len(self.cursors) == 0):
+      return(False)
+    slots = [ (self.doc.get_iter_at_mark(self.doc.get_insert()).get_offset(), None) ]
+    for cursor in self.cursors:
+      slots.append((cursor.tag.get_start_iter().get_offset(), cursor))
+    columns = [ self.doc.get_iter_at_offset(offset).get_line_offset() for (offset, cursor) in slots ]
+    pads = padding_to_align(columns)
+    for index in sorted(range(len(slots)), key=lambda i: slots[i][0], reverse=True):
+      (offset, cursor) = slots[index]
+      if (pads[index] == 0):
+        continue
+      self.doc.insert(self.doc.get_iter_at_offset(offset), ' ' * pads[index])
+      after = self.doc.get_iter_at_offset(offset + pads[index])
+      if (cursor is None):
+        self.doc.place_cursor(after)
+      else:
+        cursor.tag.move_marks(after, after)
 
   # insert text at every cursor
   def mc_insert(self, start_delta, text):
@@ -614,6 +635,11 @@ class Cursor:
 
 
 
+
+# the spaces each column needs to move to the rightmost column
+def padding_to_align(columns):
+  target = max(columns)
+  return([ target - column for column in columns ])
 
 # the column of the occurrence of `char` in `text` nearest `target`, preferring the
 #  left on a tie, or None if there's no occurrence

@@ -28,6 +28,12 @@ def alt_drag(editor, start, end):
     alt_drag_move(editor, end)
 
 
+def alt_drag_release(editor, end):
+    x, y = window_point_for_offset(editor.view, end)
+    editor.plugin.on_event(editor.view, FakePointerEvent(
+        Gdk.EventType.BUTTON_RELEASE, x, y, alt=True, button1=True))
+
+
 def alt_drag_move(editor, end):
     x, y = window_point_for_offset(editor.view, end)
     editor.plugin.on_event(editor.view, FakePointerEvent(
@@ -324,6 +330,76 @@ def test_alt_drag_skips_lines_without_the_character(make_editor):
     alt_drag(editor, start=1, end=9)
 
     assert editor.cursor_offsets() == [9]
+
+
+def key_press(keyval, ctrl=False):
+    _, entries = Gdk.Keymap.get_default().get_entries_for_keyval(keyval)
+    event = Gdk.Event.new(Gdk.EventType.KEY_PRESS)
+    event.key.keyval = keyval
+    event.key.hardware_keycode = entries[0].keycode
+    event.key.state = Gdk.ModifierType.CONTROL_MASK if ctrl else 0
+    return event
+
+
+def test_ctrl_space_aligns_the_carets(make_editor):
+    editor = make_editor("a=1\nbbb=2\ncc=3")
+    alt_drag(editor, start=1, end=12)
+    alt_drag_release(editor, end=12)
+
+    handled = editor.plugin.on_key_press(editor.view, key_press(Gdk.KEY_space, ctrl=True))
+
+    assert handled is True
+    assert editor.text() == "a  =1\nbbb=2\ncc =3"
+
+
+def test_align_keeps_a_caret_selection_on_its_text(make_editor):
+    editor = make_editor("a=1\nbbb=2")
+    alt_drag(editor, start=1, end=8)
+    alt_drag_release(editor, end=8)
+    cursor = editor.plugin.cursors[0]
+    cursor.tag.move_marks(editor.iter_at(7), editor.iter_at(8))
+
+    editor.plugin.align_carets()
+
+    assert editor.text() == "a  =1\nbbb=2"
+    assert editor.cursor_selections() == [(9, 10)]
+
+
+def test_a_tab_counts_as_one_column_when_aligning(make_editor):
+    editor = make_editor("a\t=1\nbbb=2")
+    alt_drag(editor, start=2, end=8)
+    alt_drag_release(editor, end=8)
+
+    editor.plugin.align_carets()
+
+    assert editor.text() == "a\t =1\nbbb=2"
+
+
+def test_ctrl_space_without_extra_carets_is_left_alone(make_editor):
+    editor = make_editor("a=1\nbbb=2")
+
+    handled = editor.plugin.on_key_press(editor.view, key_press(Gdk.KEY_space, ctrl=True))
+
+    assert handled is False
+    assert editor.text() == "a=1\nbbb=2"
+
+
+def test_align_carets_lines_up_the_equals_signs(make_editor):
+    editor = make_editor("a=1\nbbb=2\ncc=3")
+    alt_drag(editor, start=1, end=12)
+    alt_drag_release(editor, end=12)
+
+    editor.plugin.align_carets()
+
+    assert editor.text() == "a  =1\nbbb=2\ncc =3"
+
+
+def test_padding_moves_each_column_to_the_rightmost():
+    assert multicursor.padding_to_align([1, 3, 2]) == [2, 0, 1]
+
+
+def test_padding_is_zero_when_columns_already_match():
+    assert multicursor.padding_to_align([4, 4, 4]) == [0, 0, 0]
 
 
 def test_closest_column_picks_the_nearest_occurrence():
