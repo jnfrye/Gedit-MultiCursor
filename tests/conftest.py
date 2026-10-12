@@ -147,8 +147,38 @@ class Editor(object):
     def type_text(self, text):
         """Type text the way GTK does: one user action, replacing any selection."""
         self.buffer.begin_user_action()
+        if self.buffer.get_has_selection():
+            self.buffer.delete_selection(True, True)
         self.buffer.insert_interactive_at_cursor(text, len(text.encode()), True)
         self.buffer.end_user_action()
+
+    def press_backspace(self):
+        """Backspace the way GTK does: delete the selection, or the character before the caret."""
+        self.buffer.begin_user_action()
+        if self.buffer.get_has_selection():
+            self.buffer.delete_selection(True, True)
+        else:
+            end = self.buffer.get_iter_at_mark(self.buffer.get_insert())
+            start = end.copy()
+            start.backward_char()
+            self.buffer.delete(start, end)
+        self.buffer.end_user_action()
+
+    def press_delete(self):
+        """Delete the way GTK does: delete the selection, or the character after the caret."""
+        self.buffer.begin_user_action()
+        if self.buffer.get_has_selection():
+            self.buffer.delete_selection(True, True)
+        else:
+            start = self.buffer.get_iter_at_mark(self.buffer.get_insert())
+            end = start.copy()
+            end.forward_char()
+            self.buffer.delete(start, end)
+        self.buffer.end_user_action()
+
+    def text(self):
+        return self.buffer.get_text(
+            self.buffer.get_start_iter(), self.buffer.get_end_iter(), True)
 
     def delete_range(self, start, end):
         self.buffer.begin_user_action()

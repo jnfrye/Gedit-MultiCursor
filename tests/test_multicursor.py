@@ -170,6 +170,46 @@ def test_box_selection_color_follows_a_scheme_change(make_editor):
     assert tag.get_property('background-rgba').to_string() == expected.to_string()
 
 
+def test_typing_replaces_the_box_on_every_line_dragging_right(make_editor):
+    editor = make_editor("abcdef\nabcdef\nabcdef\nabcdef")
+    ctrl_drag(editor, start=1, end=18)
+    ctrl_drag_release(editor, end=18)
+
+    editor.type_text("X")
+
+    assert editor.text() == "aXef\naXef\naXef\nabcdef"
+
+
+def test_typing_replaces_the_box_on_every_line_dragging_left(make_editor):
+    editor = make_editor("abcdef\nabcdef\nabcdef\nabcdef")
+    ctrl_drag(editor, start=4, end=15)
+    ctrl_drag_release(editor, end=15)
+
+    editor.type_text("X")
+
+    assert editor.text() == "aXef\naXef\naXef\nabcdef"
+
+
+def test_backspace_removes_the_box_on_every_line(make_editor):
+    editor = make_editor("abcdef\nabcdef\nabcdef\nabcdef")
+    ctrl_drag(editor, start=1, end=18)
+    ctrl_drag_release(editor, end=18)
+
+    editor.press_backspace()
+
+    assert editor.text() == "aef\naef\naef\nabcdef"
+
+
+def test_delete_key_removes_the_box_on_every_line(make_editor):
+    editor = make_editor("abcdef\nabcdef\nabcdef\nabcdef")
+    ctrl_drag(editor, start=4, end=15)
+    ctrl_drag_release(editor, end=15)
+
+    editor.press_delete()
+
+    assert editor.text() == "aef\naef\naef\nabcdef"
+
+
 def test_line_ending_inside_box_is_selected_to_its_end(make_editor):
     editor = make_editor("abcdef\nabcd\na\nabcdef")
 
