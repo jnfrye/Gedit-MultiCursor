@@ -52,6 +52,7 @@ class MultiCursor(GObject.Object, Gedit.ViewActivatable):
     self.add_handler(self.view, 'event', self.on_event)
     self.add_handler(self.view, 'move-cursor', self.mc_move_cursor)
     self.add_handler(self.view, 'copy-clipboard', self.mc_save_clipboard)
+    self.add_handler(self.view, 'copy-clipboard', self.mc_put_box_on_clipboard, 'after')
     self.add_handler(self.view, 'cut-clipboard', self.mc_save_clipboard)
     self.add_handler(self.view, 'paste-clipboard', self.mc_paste_clipboard)
     self.add_handler(self.view, 'undo', self.undo)
@@ -317,8 +318,69 @@ class MultiCursor(GObject.Object, Gedit.ViewActivatable):
     for cursor in self.cursors:
       cursor.save_text()
       
+  # put the selected text of every cursor on the system clipboard, top to bottom
+  def mc_put_box_on_clipboard(self, view):
+    pieces = [ ]
+    bounds = self.doc.get_selection_bounds()
+    if (bounds):
+      pieces.append((bounds[0].get_offset(), self.doc.get_text(bounds[0], bounds[1], True)))
+    for cursor in self.cursors:
+      start = cursor.tag.get_start_iter()
+      if (cursor.tag.get_length() > 0):
+        pieces.append((start.get_offset(), cursor.tag.get_text()))
+    if (len(pieces) > 0):
+      text = '\n'.join(piece for (offset, piece) in sorted(pieces))
+      Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(text, -1)
+
+  # paste the system clipboard ourselves, so each caret can get its own line
   def mc_paste_clipboard(self, view):
-    self._handled_paste = True
+    view.stop_emission_by_name('paste-clipboard')
+    text = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).wait_for_text()
+    if (text is not None):
+      self.paste_text(text)
+
+  # insert the text at every caret, top to bottom: one line per caret when the
+  #  counts match, otherwise the whole text at each caret
+  def paste_text(self, text):
+    slots = [ ]
+    if (self.doc.get_has_selection()):
+      (sel_start, sel_end) = self.doc.get_selection_bounds()
+      slots.append(sel_start.get_offset())
+    else:
+      slots.append(self.doc.get_iter_at_mark(self.doc.get_insert()).get_offset())
+    for cursor in self.cursors:
+      slots.append(cursor.tag.get_start_iter().get_offset())
+    lines = text.split('\n')
+    if ((len(slots) > 1) and (len(lines) == len(slots))):
+      pieces = lines
+    else:
+      pieces = [ text ] * len(slots)
+    order = sorted(range(len(slots)), key=lambda i: slots[i])
+    for index in reversed(order):
+      piece = pieces[index]
+      if (index == 0):
+        self.paste_at_main(piece)
+      else:
+        self.paste_at_cursor(self.cursors[index - 1], piece)
+
+  def paste_at_main(self, piece):
+    if (self.doc.get_has_selection()):
+      (sel_start, sel_end) = self.doc.get_selection_bounds()
+      self.doc.delete(sel_start, sel_end)
+    start = self.doc.get_iter_at_mark(self.doc.get_insert())
+    offset = start.get_offset()
+    self.doc.insert(start, piece)
+    self.doc.place_cursor(self.doc.get_iter_at_offset(offset + len(piece)))
+
+  def paste_at_cursor(self, cursor, piece):
+    start = cursor.tag.get_start_iter()
+    end = cursor.tag.get_end_iter()
+    offset = start.get_offset()
+    if (end.get_offset() != offset):
+      self.doc.delete(start, end)
+    self.doc.insert(self.doc.get_iter_at_offset(offset), piece)
+    after = self.doc.get_iter_at_offset(offset + len(piece))
+    cursor.tag.move_marks(after, after)
 
 
 # this class manages a single extra cursor in the document

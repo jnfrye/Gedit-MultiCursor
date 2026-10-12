@@ -1,6 +1,7 @@
 from gi.repository import Gdk, Gtk
 
-from conftest import FakeButtonEvent, FakePointerEvent, window_point_for_offset
+from conftest import (FakeButtonEvent, FakePointerEvent, system_clipboard_text,
+                      set_system_clipboard_text, window_point_for_offset)
 
 
 def ctrl_drag(editor, start, end):
@@ -208,6 +209,68 @@ def test_delete_key_removes_the_box_on_every_line(make_editor):
     editor.press_delete()
 
     assert editor.text() == "aef\naef\naef\nabcdef"
+
+
+def test_copying_a_box_puts_every_line_on_the_clipboard(make_editor):
+    editor = make_editor("abcdef\nabcdef\nabcdef\nabcdef")
+    ctrl_drag(editor, start=1, end=18)
+    ctrl_drag_release(editor, end=18)
+
+    editor.view.emit('copy-clipboard')
+
+    assert system_clipboard_text() == "bcd\nbcd\nbcd"
+
+
+def test_copying_a_plain_selection_copies_just_that_text(make_editor):
+    editor = make_editor("abcdef\nabcdef")
+    editor.buffer.select_range(editor.iter_at(1), editor.iter_at(4))
+
+    editor.view.emit('copy-clipboard')
+
+    assert system_clipboard_text() == "bcd"
+
+
+def test_single_caret_pastes_multi_line_text_with_line_breaks(make_editor):
+    editor = make_editor("xyz")
+    editor.buffer.place_cursor(editor.iter_at(1))
+    set_system_clipboard_text("bcd\nBCD")
+
+    editor.paste()
+
+    assert editor.text() == "xbcd\nBCDyz"
+
+
+def test_matching_line_counts_paste_one_line_per_caret(make_editor):
+    editor = make_editor("xyz\nxyz")
+    ctrl_drag(editor, start=1, end=5)
+    ctrl_drag_release(editor, end=5)
+    set_system_clipboard_text("bcd\nBCD")
+
+    editor.paste()
+
+    assert editor.text() == "xbcdyz\nxBCDyz"
+
+
+def test_mismatched_line_counts_paste_the_full_text_at_each_caret(make_editor):
+    editor = make_editor("xyz\nxyz")
+    ctrl_drag(editor, start=1, end=5)
+    ctrl_drag_release(editor, end=5)
+    set_system_clipboard_text("bcd\nBCD\nxxx")
+
+    editor.paste()
+
+    assert editor.text() == "xbcd\nBCD\nxxxyz\nxbcd\nBCD\nxxxyz"
+
+
+def test_pasting_over_a_box_replaces_it_line_by_line(make_editor):
+    editor = make_editor("abcdef\nabcdef")
+    ctrl_drag(editor, start=1, end=11)
+    ctrl_drag_release(editor, end=11)
+    set_system_clipboard_text("X\nY")
+
+    editor.paste()
+
+    assert editor.text() == "aXef\naYef"
 
 
 def test_line_ending_inside_box_is_selected_to_its_end(make_editor):

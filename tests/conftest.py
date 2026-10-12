@@ -90,6 +90,15 @@ class FakeButtonEvent(FakePointerEvent):
             Gdk.EventType.BUTTON_PRESS, x, y, ctrl=ctrl)
 
 
+def system_clipboard_text():
+    clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+    return clipboard.wait_for_text()
+
+
+def set_system_clipboard_text(text):
+    Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(text, -1)
+
+
 def window_point_for_offset(view, offset):
     """Return window coordinates of the character at `offset` in the buffer."""
     buf = view.get_buffer()
@@ -175,6 +184,11 @@ class Editor(object):
             end.forward_char()
             self.buffer.delete(start, end)
         self.buffer.end_user_action()
+
+    def paste(self):
+        """Paste from the system clipboard the way GTK does, then let it finish."""
+        self.view.emit('paste-clipboard')
+        pump(lambda: False, timeout=0.3)
 
     def text(self):
         return self.buffer.get_text(
