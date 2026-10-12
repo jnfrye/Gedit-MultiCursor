@@ -1,4 +1,5 @@
 from gi.repository import GObject, Gtk, Gdk, Gedit
+import xml.etree.ElementTree as ElementTree
 
 
 class MultiCursor(GObject.Object, Gedit.ViewActivatable):
@@ -23,6 +24,8 @@ class MultiCursor(GObject.Object, Gedit.ViewActivatable):
     self.cursors = [ ]
     # the Ctrl+drag in progress, if any
     self._drag = None
+    # the handler that recolors the selection when the style scheme changes
+    self._scheme_handler = None
     # map keyboard shortcuts
     self.keymap = {
       'Escape': self.clear_cursors
@@ -44,6 +47,7 @@ class MultiCursor(GObject.Object, Gedit.ViewActivatable):
   def do_activate(self):
     # retain a reference to the document
     self.doc = self.view.get_buffer()
+    self._scheme_handler = self.doc.connect('notify::style-scheme', self.on_style_scheme_changed)
     # bind events
     self.add_handler(self.view, 'event', self.on_event)
     self.add_handler(self.view, 'move-cursor', self.mc_move_cursor)
@@ -55,6 +59,17 @@ class MultiCursor(GObject.Object, Gedit.ViewActivatable):
   def do_deactivate(self):
     self.clear_cursors()
     self.remove_handlers()
+    if (self._scheme_handler is not None):
+      self.doc.disconnect(self._scheme_handler)
+      self._scheme_handler = None
+
+  # recolor the selection tag when the document's style scheme changes
+  def on_style_scheme_changed(self, doc, pspec):
+    tag = self.doc.get_tag_table().lookup('multicursor')
+    if (tag is not None):
+      (background, foreground) = selection_colors(self.view, self.doc)
+      tag.set_property('background', background)
+      tag.set_property('foreground', foreground)
 
   # receive events from the document that control multiple cursors
   def hook_document(self):
@@ -113,32 +128,56 @@ class MultiCursor(GObject.Object, Gedit.ViewActivatable):
         return(True)
     return False
 
-  # place a cursor on each line between the press and the pointer, at the press column
+  # select the box between the press and the pointer on each line between them
   def drag_to(self, view, x, y):
     drag = self._drag
+    press = self.doc.get_iter_at_offset(drag['start'])
     if (not drag['moved']):
-      self.doc.place_cursor(self.doc.get_iter_at_offset(drag['start']))
+      self.doc.place_cursor(press)
     drag['moved'] = True
     for cursor in drag['cursors']:
       self.remove_cursor(self.cursors.index(cursor))
     drag['cursors'] = [ ]
-    press_line = self.doc.get_iter_at_offset(drag['start']).get_line()
+    press_line = press.get_line()
     target_line = view.get_iter_at_location(x, y)[1].get_line()
     if (target_line >= press_line):
       lines = range(press_line + 1, target_line + 1)
     else:
       lines = range(target_line, press_line)
+    left = min(drag['x'], x)
+    right = max(drag['x'], x)
+    if (left == right):
+      self.doc.place_cursor(press)
+    else:
+      span = self.span_on_line(view, press_line, left, right)
+      if (span is not None):
+        (a, b) = span
+        if (drag['x'] <= x):
+          self.doc.select_range(a, b)
+        else:
+          self.doc.select_range(b, a)
     for line in lines:
-      start = self.doc.get_iter_at_line(line)
-      end = start.copy()
-      if (not end.ends_line()):
-        end.forward_to_line_end()
-      if (view.get_iter_location(end).x < drag['x']):
+      span = self.span_on_line(view, line, left, right)
+      if (span is None):
         continue
-      rect = view.get_iter_location(start)
-      pos = view.get_iter_at_location(drag['x'], rect.y + rect.height // 2)[1]
-      self.add_cursor(pos, pos)
+      (a, b) = span
+      self.add_cursor(a, b)
       drag['cursors'].append(self.cursors[-1])
+
+  # the iters at the left and right x positions on a line, clamped to the line's end,
+  #  or None if the line ends before the left position
+  def span_on_line(self, view, line, left, right):
+    start = self.doc.get_iter_at_line(line)
+    end = start.copy()
+    if (not end.ends_line()):
+      end.forward_to_line_end()
+    if (view.get_iter_location(end).x < left):
+      return None
+    rect = view.get_iter_location(start)
+    y = rect.y + rect.height // 2
+    a = view.get_iter_at_location(left, y)[1]
+    b = view.get_iter_at_location(right, y)[1]
+    return (a, b)
 
   def on_key_press(self, view, event):
     _, keyval, _, _, _ = Gdk.Keymap.get_default().translate_keyboard_state(event.hardware_keycode, event.state, 0)
@@ -498,6 +537,41 @@ class Cursor:
 
 
 
+# the background and foreground for selections, from the document's style scheme
+#  if it defines them, otherwise from the view's theme
+def selection_colors(view, doc):
+  background = view.get_style().lookup_color('selected_bg_color')[1].to_string()
+  foreground = view.get_style().lookup_color('selected_fg_color')[1].to_string()
+  scheme = doc.get_style_scheme()
+  if (scheme is not None):
+    colors = read_scheme_colors(scheme.get_filename(), 'selection')
+    if (colors is not None):
+      return(colors)
+  return((background, foreground))
+
+# read a style's background and foreground from a style scheme file, resolving
+#  named palette colors, or return None if the file doesn't define both
+def read_scheme_colors(filename, style_name):
+  try:
+    root = ElementTree.parse(filename).getroot()
+  except (OSError, TypeError, ElementTree.ParseError):
+    return(None)
+  palette = { c.get('name'): c.get('value') for c in root.iter('color') }
+  for style in root.iter('style'):
+    if (style.get('name') != style_name):
+      continue
+    resolved = [ ]
+    for attr in ('background', 'foreground'):
+      value = style.get(attr)
+      if ((value is not None) and not value.startswith('#')):
+        value = palette.get(value)
+      if (value is None):
+        return(None)
+      resolved.append(value)
+    return(tuple(resolved))
+  return(None)
+
+
 # this class manages a GtkTextTag, anchoring it with GtkTextMarks instead of GtkTextIters
 class MarkTag:
 
@@ -604,10 +678,7 @@ class MarkTag:
     if (tag is None):
       # style the selection part of a cursor
       if (self.name == 'multicursor'):
-        background = self.get_view_color('selected_bg_color')
-        foreground = self.get_view_color('selected_fg_color')
-        (background, foreground) = self.get_scheme_colors( 
-          'selection', (background, foreground))
+        (background, foreground) = selection_colors(self.view, self.doc)
         tag = self.doc.create_tag(self.name, 
                                    background=background, 
                                    foreground=foreground)
@@ -618,20 +689,7 @@ class MarkTag:
                                    foreground="#FFFFFF")
     return(tag)
 
-  # get the default color for the given style property of the view
-  def get_view_color(self, color_name):
-    return(self.view.get_style().lookup_color(color_name)[1].to_string())
-  
-  # get the given foreground and background colors from the current 
-  #  style scheme, falling back on the given defaults
-  def get_scheme_colors(self, style_name, defaults):
-    scheme = self.doc.get_style_scheme()
-    if (scheme is not None):
-      sel_style = scheme.get_style(style_name)
-      if (sel_style is not None):
-        return(sel_style.get_property('background'), 
-               sel_style.get_property('foreground'))
-    return(defaults)
+
     
 
 

@@ -39,15 +39,15 @@ def test_ctrl_click_adds_cursor_where_clicked(make_editor):
 def test_ctrl_drag_down_adds_cursor_on_each_line_at_press_column(make_editor):
     editor = make_editor("abcdef\nabcdef\nabcdef\nabcdef")
 
-    ctrl_drag(editor, start=2, end=19)
+    ctrl_drag(editor, start=2, end=16)
 
     assert editor.cursor_offsets() == [9, 16]
 
 
 def test_typing_after_ctrl_drag_inserts_on_every_line(make_editor):
     editor = make_editor("abcdef\nabcdef\nabcdef\nabcdef")
-    ctrl_drag(editor, start=2, end=19)
-    ctrl_drag_release(editor, end=19)
+    ctrl_drag(editor, start=2, end=16)
+    ctrl_drag_release(editor, end=16)
 
     editor.type_text("X")
 
@@ -58,20 +58,20 @@ def test_typing_after_ctrl_drag_inserts_on_every_line(make_editor):
 
 def test_repeated_motion_does_not_duplicate_carets(make_editor):
     editor = make_editor("abcdef\nabcdef\nabcdef\nabcdef")
-    ctrl_drag(editor, start=2, end=19)
+    ctrl_drag(editor, start=2, end=16)
 
-    ctrl_drag_move(editor, end=20)
-    ctrl_drag_move(editor, end=19)
+    ctrl_drag_move(editor, end=23)
+    ctrl_drag_move(editor, end=16)
 
     assert editor.cursor_offsets() == [9, 16]
 
 
 def test_motion_after_release_adds_no_carets(make_editor):
     editor = make_editor("abcdef\nabcdef\nabcdef\nabcdef")
-    ctrl_drag(editor, start=2, end=19)
-    ctrl_drag_release(editor, end=19)
+    ctrl_drag(editor, start=2, end=16)
+    ctrl_drag_release(editor, end=16)
 
-    ctrl_drag_move(editor, end=26)
+    ctrl_drag_move(editor, end=23)
 
     assert editor.cursor_offsets() == [9, 16]
 
@@ -86,6 +86,108 @@ def test_drag_without_ctrl_adds_no_carets(make_editor):
         Gdk.EventType.MOTION_NOTIFY, x, y, button1=True))
 
     assert editor.cursor_offsets() == []
+
+
+def test_ctrl_drag_down_and_right_selects_a_box(make_editor):
+    editor = make_editor("abcdef\nabcdef\nabcdef\nabcdef")
+
+    ctrl_drag(editor, start=1, end=18)
+
+    assert editor.main_selection() == (1, 4)
+    assert editor.cursor_selections() == [(8, 11), (15, 18)]
+
+
+def test_vertical_ctrl_drag_makes_carets_not_selections(make_editor):
+    editor = make_editor("abcdef\nabcdef\nabcdef\nabcdef")
+
+    ctrl_drag(editor, start=2, end=16)
+
+    assert editor.main_selection() is None
+    assert editor.cursor_selections() == [(9, 9), (16, 16)]
+
+
+def test_dragging_left_selects_the_same_box_as_dragging_right(make_editor):
+    editor = make_editor("abcdef\nabcdef\nabcdef\nabcdef")
+
+    ctrl_drag(editor, start=4, end=15)
+
+    assert editor.main_selection() == (1, 4)
+    assert editor.cursor_selections() == [(8, 11), (15, 18)]
+
+
+def test_dragging_up_and_right_selects_lines_above(make_editor):
+    editor = make_editor("abcdef\nabcdef\nabcdef\nabcdef")
+
+    ctrl_drag(editor, start=15, end=4)
+
+    assert editor.main_selection() == (15, 18)
+    assert editor.cursor_selections() == [(1, 4), (8, 11)]
+
+
+def test_moving_back_to_press_column_returns_to_carets(make_editor):
+    editor = make_editor("abcdef\nabcdef\nabcdef\nabcdef")
+    ctrl_drag(editor, start=2, end=18)
+
+    ctrl_drag_move(editor, end=16)
+
+    assert editor.main_selection() is None
+    assert editor.cursor_selections() == [(9, 9), (16, 16)]
+
+
+def test_box_selection_works_with_a_style_scheme(make_editor):
+    editor = make_editor("abcdef\nabcdef\nabcdef\nabcdef")
+    editor.use_scheme('oblivion')
+
+    ctrl_drag(editor, start=1, end=18)
+
+    assert editor.main_selection() == (1, 4)
+    assert editor.cursor_selections() == [(8, 11), (15, 18)]
+
+
+def test_box_selection_uses_the_scheme_selection_colors(make_editor):
+    editor = make_editor("abcdef\nabcdef\nabcdef\nabcdef")
+    editor.use_scheme('oblivion')
+
+    ctrl_drag(editor, start=1, end=18)
+
+    tag = editor.buffer.get_tag_table().lookup('multicursor')
+    expected = Gdk.RGBA()
+    expected.parse('#888a85')
+    assert tag.get_property('background-rgba').to_string() == expected.to_string()
+
+
+def test_box_selection_color_follows_a_scheme_change(make_editor):
+    editor = make_editor("abcdef\nabcdef\nabcdef\nabcdef")
+    editor.use_scheme('oblivion')
+    ctrl_drag(editor, start=1, end=18)
+    ctrl_drag_release(editor, end=18)
+
+    editor.use_scheme('cobalt')
+
+    tag = editor.buffer.get_tag_table().lookup('multicursor')
+    expected = Gdk.RGBA()
+    expected.parse('#0088ff')
+    assert tag.get_property('background-rgba').to_string() == expected.to_string()
+
+
+def test_line_ending_inside_box_is_selected_to_its_end(make_editor):
+    editor = make_editor("abcdef\nabcd\na\nabcdef")
+
+    ctrl_drag(editor, start=2, end=19)
+
+    assert editor.main_selection() == (2, 5)
+    assert editor.cursor_selections() == [(9, 11), (16, 19)]
+
+
+def test_release_keeps_selections_and_later_motion_does_nothing(make_editor):
+    editor = make_editor("abcdef\nabcdef\nabcdef\nabcdef")
+    ctrl_drag(editor, start=1, end=18)
+    ctrl_drag_release(editor, end=18)
+
+    ctrl_drag_move(editor, end=23)
+
+    assert editor.main_selection() == (1, 4)
+    assert editor.cursor_selections() == [(8, 11), (15, 18)]
 
 
 def test_ctrl_drag_back_up_removes_carets_and_adds_above(make_editor):
@@ -109,7 +211,7 @@ def test_ctrl_drag_skips_lines_shorter_than_press_column(make_editor):
 def test_ctrl_drag_moves_main_caret_to_press_point(make_editor):
     editor = make_editor("abcdef\nabcdef\nabcdef\nabcdef")
 
-    ctrl_drag(editor, start=2, end=19)
+    ctrl_drag(editor, start=2, end=16)
 
     caret = editor.buffer.get_iter_at_mark(editor.buffer.get_insert())
     assert caret.get_offset() == 2

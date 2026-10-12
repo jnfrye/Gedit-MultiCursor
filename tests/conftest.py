@@ -15,18 +15,17 @@ import pytest
 
 gi.require_version('Gtk', '3.0')
 gi.require_version('Gdk', '3.0')
+gi.require_version('GtkSource', '300')
 
-from gi.repository import GObject, Gdk, Gtk  # noqa: E402
+from gi.repository import Gdk, Gtk, GtkSource  # noqa: E402
 
 PLUGIN_PATH = pathlib.Path(__file__).resolve().parents[1] / 'multicursor.py'
 
 
-class GeditView(Gtk.TextView):
-    # gedit's view adds undo and redo signals on top of GtkTextView
-    __gsignals__ = {
-        'undo': (GObject.SignalFlags.RUN_LAST, None, ()),
-        'redo': (GObject.SignalFlags.RUN_LAST, None, ()),
-    }
+class GeditView(GtkSource.View):
+    # gedit's view is a GtkSourceView, which provides the undo and redo
+    #  signals and a buffer with a style scheme
+    pass
 
 
 def _install_gedit_stub():
@@ -126,14 +125,29 @@ class Editor(object):
         return sorted(c.tag.get_start_iter().get_offset()
                       for c in self.plugin.cursors)
 
+    def use_scheme(self, scheme_id):
+        scheme = GtkSource.StyleSchemeManager.get_default().get_scheme(scheme_id)
+        self.buffer.set_style_scheme(scheme)
+
+    def cursor_selections(self):
+        return sorted((c.tag.get_start_iter().get_offset(),
+                       c.tag.get_end_iter().get_offset())
+                      for c in self.plugin.cursors)
+
+    def main_selection(self):
+        bounds = self.buffer.get_selection_bounds()
+        if not bounds:
+            return None
+        return (bounds[0].get_offset(), bounds[1].get_offset())
+
     def add_cursor_at(self, offset):
         it = self.iter_at(offset)
         self.plugin.add_cursor(it, it)
 
     def type_text(self, text):
-        """Type text the way GTK does: one user action, at the main caret."""
+        """Type text the way GTK does: one user action, replacing any selection."""
         self.buffer.begin_user_action()
-        self.buffer.insert_at_cursor(text)
+        self.buffer.insert_interactive_at_cursor(text, len(text.encode()), True)
         self.buffer.end_user_action()
 
     def delete_range(self, start, end):
